@@ -95,6 +95,10 @@ type Store struct {
 	// valid CURRENT, a later missing head is an availability failure rather than
 	// permission to reinterpret the database as empty.
 	currentObserved bool
+	// destroyedObserved is monotonic. After this Store reads a terminal
+	// CURRENT, local fence checks fail with stable ErrDBDestroyed rather than
+	// process-local ErrFenced, even once ownership state has been cleared.
+	destroyedObserved bool
 
 	writerFence    *FenceToken
 	compactorFence *FenceToken
@@ -194,6 +198,9 @@ func (s *Store) claimFence(ctx context.Context, role FenceRole, ownerID string, 
 			current = &Current{NextEpoch: 1}
 		}
 		normalizeCurrent(current)
+		if err := ensureActiveCurrent(current); err != nil {
+			return nil, err
+		}
 
 		if role == FenceRoleWriter && maxPinnedViewAge != nil {
 			if current.WriterFence == nil {
@@ -317,6 +324,9 @@ func (s *Store) CheckCompactorFenceToken(ctx context.Context, token *FenceToken)
 	if err != nil {
 		return err
 	}
+	if err := ensureActiveCurrent(current); err != nil {
+		return err
+	}
 	if current == nil {
 		return ErrFenced
 	}
@@ -335,11 +345,17 @@ func (s *Store) checkFence(ctx context.Context, role FenceRole) error {
 	s.mu.Unlock()
 
 	if localFence == nil {
+		if s.hasObservedDestruction() {
+			return ErrDBDestroyed
+		}
 		return ErrFenced
 	}
 
 	current, err := s.readCurrentData(ctx)
 	if err != nil {
+		return err
+	}
+	if err := ensureActiveCurrent(current); err != nil {
 		return err
 	}
 	if current == nil {
@@ -405,10 +421,16 @@ func (s *Store) checkLocalFence(role FenceRole) error {
 	switch role {
 	case FenceRoleWriter:
 		if s.writerFence == nil {
+			if s.destroyedObserved {
+				return ErrDBDestroyed
+			}
 			return ErrFenced
 		}
 	case FenceRoleCompactor:
 		if s.compactorFence == nil {
+			if s.destroyedObserved {
+				return ErrDBDestroyed
+			}
 			return ErrFenced
 		}
 	default:
@@ -453,6 +475,13 @@ func (s *Store) appendInternal(ctx context.Context, entry *ManifestLogEntry, rol
 			}
 		}
 		if applied, err := reconcileWriterCommit(current, entry); applied || err != nil {
+			return err
+		}
+		// Reconciliation above may still acknowledge an unacknowledged commit
+		// that won its CAS before the terminal transition. No new publication
+		// may pass after that, regardless of local fence state.
+		if err := ensureActiveCurrent(current); err != nil {
+			s.invalidateLocalFences()
 			return err
 		}
 		if role == FenceRoleWriter && current.ChangeFeedEnabled && entry.Op == LogOpAddSSTable {
@@ -1101,6 +1130,9 @@ func (s *Store) Replay(ctx context.Context) (*Manifest, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := ensureActiveCurrent(current); err != nil {
+		return nil, err
+	}
 	return s.replayCurrent(ctx, current, false)
 }
 
@@ -1112,6 +1144,9 @@ func (s *Store) ReplayWithArtifactValidation(ctx context.Context) (*Manifest, er
 	if err != nil {
 		return nil, err
 	}
+	if err := ensureActiveCurrent(current); err != nil {
+		return nil, err
+	}
 	return s.replayCurrent(ctx, current, true)
 }
 
@@ -1121,6 +1156,9 @@ func (s *Store) ReplayWithArtifactValidation(ctx context.Context) (*Manifest, er
 func (s *Store) ReplayWithCurrent(ctx context.Context) (*Manifest, *Current, error) {
 	current, err := s.readCurrent(ctx)
 	if err != nil {
+		return nil, nil, err
+	}
+	if err := ensureActiveCurrent(current); err != nil {
 		return nil, nil, err
 	}
 	m, err := s.replayCurrent(ctx, current, false)
@@ -1470,6 +1508,9 @@ func (s *Store) EnableChangeFeed(ctx context.Context, payload ChangeFeedPayload)
 			current = &Current{NextEpoch: 1}
 		}
 		normalizeCurrent(current)
+		if err := ensureActiveCurrent(current); err != nil {
+			return err
+		}
 		if current.ChangeFeedEnabled {
 			if !current.ChangeFeedPayload.Valid() {
 				return fmt.Errorf("%w: change feed payload=%q", ErrInvalidManifest, current.ChangeFeedPayload)
@@ -1544,6 +1585,9 @@ func (s *Store) LoadChangeFeedView(ctx context.Context) (*ChangeFeedView, error)
 	loadedAt := time.Now()
 	current, err := s.readCurrent(ctx)
 	if err != nil {
+		return nil, err
+	}
+	if err := ensureActiveCurrent(current); err != nil {
 		return nil, err
 	}
 	if current != nil && current.ChangeFeedEnabled && !current.ChangeFeedPayload.Valid() {
@@ -1670,6 +1714,9 @@ func (s *Store) PrepareCheckpoint(ctx context.Context) (CheckpointCommand, error
 	}
 	if current == nil {
 		return CheckpointCommand{}, ErrInvalidManifest
+	}
+	if err := ensureActiveCurrent(current); err != nil {
+		return CheckpointCommand{}, err
 	}
 
 	state, err := s.fullReplay(ctx, current)
@@ -1976,6 +2023,9 @@ func (s *Store) readCurrentData(ctx context.Context) (*Current, error) {
 	s.mu.Lock()
 	s.current = current.Clone()
 	s.currentObserved = true
+	if current.Destroyed() {
+		s.destroyedObserved = true
+	}
 	s.mu.Unlock()
 	return current, nil
 }
@@ -2004,6 +2054,9 @@ func (s *Store) readCurrentWithETag(ctx context.Context) (*Current, string, erro
 	s.commitCurrent = current.Clone()
 	s.currentETag = etag
 	s.currentObserved = true
+	if current.Destroyed() {
+		s.destroyedObserved = true
+	}
 	s.mu.Unlock()
 	return current, etag, nil
 }
@@ -2020,6 +2073,12 @@ func (s *Store) hasObservedCurrent() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.currentObserved
+}
+
+func (s *Store) hasObservedDestruction() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.destroyedObserved
 }
 
 func (s *Store) writeCurrentWithCAS(ctx context.Context, current *Current, etag string) error {
@@ -2062,6 +2121,9 @@ func (s *Store) writeEncodedCurrentWithCAS(
 	s.commitCurrent = current.Clone()
 	s.currentETag = newETag
 	s.currentObserved = true
+	if current.Destroyed() {
+		s.destroyedObserved = true
+	}
 	s.mu.Unlock()
 	return nil
 }
@@ -2080,6 +2142,9 @@ func (s *Store) AdvanceChangeFeedLogStart(ctx context.Context, floor uint64, tok
 		}
 		if current == nil {
 			return nil, nil
+		}
+		if err := ensureActiveCurrent(current); err != nil {
+			return nil, err
 		}
 		if err := checkFenceToken(token, current.CompactorFence); err != nil {
 			return nil, err

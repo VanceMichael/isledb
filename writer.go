@@ -59,6 +59,7 @@ type writer struct {
 	workerDone          chan struct{}
 
 	fenced     atomic.Bool
+	destroyed  atomic.Bool
 	fenceToken *manifest.FenceToken
 
 	closed            atomic.Bool
@@ -286,6 +287,9 @@ func (w *writer) ensureWritable() error {
 	if w.closed.Load() {
 		return ErrWriterClosed
 	}
+	if w.destroyed.Load() {
+		return manifest.ErrDBDestroyed
+	}
 	if w.fenced.Load() {
 		return manifest.ErrFenced
 	}
@@ -450,6 +454,9 @@ func (w *writer) flushInternal(ctx context.Context, terminalOnError, forceMainte
 	if err := w.backgroundError(); err != nil {
 		return err
 	}
+	if w.destroyed.Load() {
+		return manifest.ErrDBDestroyed
+	}
 	if w.fenced.Load() {
 		return manifest.ErrFenced
 	}
@@ -459,6 +466,9 @@ func (w *writer) flushInternal(ctx context.Context, terminalOnError, forceMainte
 	if err := w.pollPendingMaintenance(ctx, forceMaintenancePoll); err != nil {
 		if isFenceError(err) {
 			w.fenced.Store(true)
+		}
+		if isDestroyedError(err) {
+			w.destroyed.Store(true)
 		}
 		return fmt.Errorf("apply maintenance command: %w", err)
 	}
@@ -489,7 +499,8 @@ func (w *writer) flushInternal(ctx context.Context, terminalOnError, forceMainte
 			if err != nil {
 				w.mu.Lock()
 				w.immQueue = append(toFlush[i:], w.immQueue...)
-				if terminalOnError && !errors.Is(err, context.Canceled) && !isFenceError(err) {
+				if terminalOnError && !errors.Is(err, context.Canceled) &&
+					!isFenceError(err) && !isDestroyedError(err) {
 					err = w.recordBackgroundFailureLocked(err)
 				}
 				w.mu.Unlock()
@@ -661,6 +672,9 @@ func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) error 
 		if isFenceError(appendErr) {
 			w.fenced.Store(true)
 		}
+		if isDestroyedError(appendErr) {
+			w.destroyed.Store(true)
+		}
 		return fmt.Errorf("update manifest: %w", appendErr)
 	}
 	w.metrics.ObserveFlushBytes(pending.sstable.Size)
@@ -720,6 +734,11 @@ func (w *writer) flushLoop() {
 		}
 		if isFenceError(err) {
 			slog.Error("isledb: writer fenced, stopping background flush",
+				"component", "writer", "epoch", w.epoch)
+			return
+		}
+		if isDestroyedError(err) {
+			slog.Error("isledb: database destroyed, stopping writer background flush",
 				"component", "writer", "epoch", w.epoch)
 			return
 		}

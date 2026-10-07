@@ -772,6 +772,9 @@ func (m *Maintenance) Run(ctx context.Context) error {
 			if isFenceError(err) {
 				return err
 			}
+			if isDestroyedError(err) {
+				return err
+			}
 			if errors.Is(err, manifest.ErrFenceConflict) {
 				slog.Debug("isledb: maintenance cycle skipped after concurrent manifest update")
 			} else if m.opts.onError != nil {
@@ -1206,6 +1209,12 @@ func (m *Maintenance) reconcilePendingCommand(ctx context.Context) (bool, error)
 		head.Epoch != m.fenceToken.Epoch ||
 		head.OwnerID != m.fenceToken.Owner ||
 		!head.ClaimedAt.Equal(m.fenceToken.ClaimedAt) {
+		// The sweep removes maintenance HEAD immediately after the terminal
+		// CURRENT commit. Classify that stale-mailbox result through CURRENT so
+		// a stale process converges on the stable destruction error.
+		if current, readErr := m.manifestLog.ReadCurrentData(ctx); readErr == nil && current.Destroyed() {
+			return false, manifest.ErrDBDestroyed
+		}
 		return false, manifest.ErrFenced
 	}
 	if head.Pending == nil {
@@ -1215,6 +1224,9 @@ func (m *Maintenance) reconcilePendingCommand(ctx context.Context) (bool, error)
 	current, err := m.manifestLog.ReadCurrentData(ctx)
 	if err != nil {
 		return false, err
+	}
+	if current.Destroyed() {
+		return false, manifest.ErrDBDestroyed
 	}
 	m.statsMu.Lock()
 	if m.currentStats != nil {

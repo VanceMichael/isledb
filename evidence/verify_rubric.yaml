@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: "销毁先以条件更新提交不可逆的终止 CURRENT 并使旧 writer/compactor fence 失效，任何数据删除都不会先于该可观察终止决定。"
+  - id: 2
+    type: f2p
+    text: "终止后新的 Open/OpenBucket 以及 Writer、Reader、ChangeReader、Maintenance 入口和刷新统一返回稳定的已销毁错误，不会把前缀当作新空库。"
+  - id: 3
+    type: f2p
+    text: "终止前取得所有权的 Writer Flush/Close 和 Maintenance 命令无法再发布 CURRENT 或 maintenance HEAD；与销毁并发时只有终止前已完整提交或被拒绝两种结果。"
+  - id: 4
+    type: f2p
+    text: "已加载 Reader、Snapshot 和 Iterator 只在现有 pinned-view 年龄内保持固定只读结果，不能刷新或延长为活跃数据库，视图过期后确定返回已销毁状态。"
+  - id: 5
+    type: f2p
+    text: "清理覆盖 SST、change batch、manifest snapshot/page 与日志、GC 计划或标记和 maintenance HEAD，最终只保留防复活所需的最小终止标记。"
+  - id: 6
+    type: f2p
+    text: "终止提交响应丢失、对象列举失败、批量删除部分失败和进程重启均可通过持久状态继续；重复销毁幂等，不会恢复活跃状态或永久卡在半删除。"
+  - id: 7
+    type: p2p
+    text: "普通 DB.Close、未初始化前缀、损坏或意外丢失 CURRENT 的既有错误，以及未销毁数据库的 Writer、Reader、ChangeReader、Maintenance 和回收行为保持兼容。"

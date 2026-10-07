@@ -182,6 +182,58 @@ func (db *DB) Close() error
 handles explicitly when their errors matter; use `DB.Close` as the final
 process-level cleanup.
 
+## Destroy a database
+
+```go
+func Destroy(
+    ctx context.Context,
+    bucketURL string,
+    opts DestroyOptions,
+) (DestroyResult, error)
+
+func DestroyBucket(
+    ctx context.Context,
+    bucket *blob.Bucket,
+    bucketName string,
+    opts DestroyOptions,
+) (DestroyResult, error)
+
+type DestroyOptions struct {
+    Prefix string
+}
+
+type DestroyResult struct {
+    Terminal   bool
+    Swept      bool
+    RetryAfter time.Duration
+}
+```
+
+`Destroy` permanently takes one prefix offline. It does not require an open
+`DB`, and closing a database with `DB.Close` never destroys it.
+
+The first conditional write commits an irreversible destroyed state to
+`manifest/CURRENT` and invalidates every existing writer and compactor fence.
+After that commit, new opens and handle creations fail with
+`ErrDatabaseDestroyed`, stale writers and maintenance processes can no longer
+publish, and reader refreshes fail; already-loaded Reader, Snapshot, and
+Iterator views remain readable until their existing `MaxPinnedViewAge`
+boundary.
+
+Object deletion follows in two idempotent, crash-safe phases. Control objects
+are removed immediately. SSTs, change batches, and manifest snapshots and
+pages are removed only after the pinned-view safety window committed in
+`CURRENT` elapses. When the call returns before that window, `Terminal` is
+true, `Swept` is false, and `RetryAfter` reports how long to wait; repeat the
+same `Destroy` call later. Interrupted listings or batch deletes resume from a
+cursor persisted in `CURRENT`, so repeating the call is always safe. The
+terminal `CURRENT` is retained as the tombstone and is the only object left
+once `Swept` is true.
+
+An uninitialized prefix and a non-empty prefix whose `CURRENT` is missing or
+corrupt fail closed with `ErrManifestUnavailable`; no tombstone is written in
+those cases.
+
 ## SST output policy
 
 SST encoding is runtime output policy. It affects newly written files and is
@@ -1189,6 +1241,8 @@ if errors.Is(err, isledb.ErrBackpressure) {
 | `ErrChangeFeedPayloadMismatch` | Requested payload differs from persisted mode |
 | `ErrStorePolicyMismatch` | Writer policy differs from persisted store policy |
 | `ErrCommitIndeterminate` | An uncertain writer commit can no longer be proven because its manifest evidence was retired |
+| `ErrDatabaseDestroyed` | The prefix has committed the irreversible destroyed state; opens, publications, and refreshes are permanently rejected |
+| `ErrManifestUnavailable` | `CURRENT` is missing, empty, or unreadable after the database was initialized; also returned when `Destroy` targets an uninitialized or headless prefix |
 
 ### Writer
 

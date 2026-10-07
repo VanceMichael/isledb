@@ -158,7 +158,8 @@ func (w *Writer) Flush(ctx context.Context) error {
 // the Writer cannot be used again.
 func (w *Writer) Close(ctx context.Context) error {
 	err := w.w.close(ctx)
-	if err == nil || errors.Is(err, manifest.ErrFenced) || errors.Is(err, ErrWriterFailed) {
+	if err == nil || errors.Is(err, manifest.ErrFenced) || errors.Is(err, ErrWriterFailed) ||
+		errors.Is(err, manifest.ErrDBDestroyed) {
 		w.releaseWriter()
 	}
 	return err
@@ -166,7 +167,8 @@ func (w *Writer) Close(ctx context.Context) error {
 
 func (w *Writer) closeDB() error {
 	err := w.w.closeWithTimeout(30 * time.Second)
-	if err == nil || errors.Is(err, manifest.ErrFenced) || errors.Is(err, ErrWriterFailed) {
+	if err == nil || errors.Is(err, manifest.ErrFenced) || errors.Is(err, ErrWriterFailed) ||
+		errors.Is(err, manifest.ErrDBDestroyed) {
 		w.releaseWriter()
 	}
 	return err

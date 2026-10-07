@@ -149,6 +149,69 @@ type Current struct {
 	LastWriterCommit     *WriterCommitMarker       `json:"last_writer_commit,omitempty"`
 	MaintenanceReceipt   *MaintenanceReceipt       `json:"maintenance_receipt,omitempty"`
 	MaintenanceScheduler MaintenanceSchedulerState `json:"maintenance_scheduler,omitempty"`
+
+	// Lifecycle is empty for every active database. LifecycleDestroyed marks
+	// the irreversible terminal state committed before any destruction sweep.
+	// A terminal CURRENT is itself the retained tombstone: it is never deleted,
+	// so a later Open cannot mistake the prefix for a new database.
+	Lifecycle   LifecycleState     `json:"lifecycle,omitempty"`
+	Destruction *DestructionRecord `json:"destruction,omitempty"`
+}
+
+// LifecycleState is the database lifecycle phase recorded in CURRENT.
+type LifecycleState string
+
+const (
+	// LifecycleActive is the zero value for every normal database.
+	LifecycleActive LifecycleState = ""
+	// LifecycleDestroyed is irreversible. All opens, fence claims, and
+	// publications fail with ErrDBDestroyed once CURRENT carries this value.
+	LifecycleDestroyed LifecycleState = "destroyed"
+)
+
+// Valid reports whether the lifecycle value is a recognized state.
+func (l LifecycleState) Valid() bool {
+	switch l {
+	case LifecycleActive, LifecycleDestroyed:
+		return true
+	default:
+		return false
+	}
+}
+
+// DestructionRecord is the terminal marker and durable sweep progress carried
+// by a destroyed CURRENT. The terminal commit is the only operation that
+// creates it; sweep progress updates only advance its cursor and Swept flag.
+type DestructionRecord struct {
+	// DestroyedAt is when the terminal CURRENT was committed.
+	DestroyedAt time.Time `json:"destroyed_at"`
+	// PinnedViewAge is copied from CURRENT.MaxPinnedViewAge at the terminal
+	// commit. Physical data deletion waits for DestroyedAt + PinnedViewAge so
+	// already-loaded pinned views can finish within their existing boundary.
+	PinnedViewAge time.Duration `json:"pinned_view_age_nanos"`
+	// SweepCursor is the full object key of the last key whose deletion batch
+	// completed. Recovery restarts the listing from the prefix root but skips
+	// every key at or below this lexicographic lower bound. It is only a
+	// conservative resume marker: object deletion is idempotent.
+	SweepCursor string `json:"sweep_cursor,omitempty"`
+	// Swept is true only after a complete prefix listing found no remaining
+	// object other than the terminal CURRENT.
+	Swept bool `json:"swept,omitempty"`
+	// SweptAt records when Swept first became true.
+	SweptAt time.Time `json:"swept_at,omitempty"`
+}
+
+// NotBefore is the earliest time physical data objects may be deleted.
+func (r *DestructionRecord) NotBefore() time.Time {
+	if r == nil {
+		return time.Time{}
+	}
+	return r.DestroyedAt.Add(r.PinnedViewAge)
+}
+
+// Destroyed reports whether CURRENT is in the irreversible terminal state.
+func (c *Current) Destroyed() bool {
+	return c != nil && c.Lifecycle == LifecycleDestroyed
 }
 
 // MaintenanceSchedulerState is advisory control-plane state. It affects work
@@ -234,6 +297,9 @@ func EncodeCurrent(c *Current) ([]byte, error) {
 	if err := validateCurrentFormat(encoded); err != nil {
 		return nil, err
 	}
+	if err := validateLifecycle(encoded); err != nil {
+		return nil, err
+	}
 	return json.Marshal(encoded)
 }
 
@@ -248,10 +314,44 @@ func DecodeCurrent(data []byte) (*Current, error) {
 	if err := validateCurrentFormat(&c); err != nil {
 		return nil, err
 	}
+	if err := validateLifecycle(&c); err != nil {
+		return nil, err
+	}
 	if err := validateCurrentRefs(&c); err != nil {
 		return nil, err
 	}
 	return &c, nil
+}
+
+// validateLifecycle enforces the terminal-state invariant: a destroyed
+// CURRENT must carry a complete destruction record with a positive safety
+// window, and an active CURRENT must not carry one.
+func validateLifecycle(c *Current) error {
+	if !c.Lifecycle.Valid() {
+		return fmt.Errorf("%w: unknown lifecycle=%q", ErrInvalidManifest, c.Lifecycle)
+	}
+	switch c.Lifecycle {
+	case LifecycleActive:
+		if c.Destruction != nil {
+			return fmt.Errorf("%w: active CURRENT carries a destruction record", ErrInvalidManifest)
+		}
+	case LifecycleDestroyed:
+		r := c.Destruction
+		if r == nil {
+			return fmt.Errorf("%w: destroyed CURRENT is missing its destruction record", ErrInvalidManifest)
+		}
+		if r.DestroyedAt.IsZero() {
+			return fmt.Errorf("%w: destroyed CURRENT has zero destroyed_at", ErrInvalidManifest)
+		}
+		if r.PinnedViewAge <= 0 {
+			return fmt.Errorf("%w: destroyed CURRENT has non-positive pinned_view_age=%s",
+				ErrInvalidManifest, r.PinnedViewAge)
+		}
+		if r.Swept && r.SweptAt.IsZero() {
+			return fmt.Errorf("%w: swept CURRENT has zero swept_at", ErrInvalidManifest)
+		}
+	}
+	return nil
 }
 
 func validateCurrentFormat(c *Current) error {

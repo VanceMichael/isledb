@@ -54,7 +54,7 @@ usually do not exist because object stores expose keys, not real directories.
 
 | Object family | Purpose | Lifecycle |
 | --- | --- | --- |
-| `manifest/CURRENT` | Authoritative database head and visibility boundary | Updated with conditional writes; never deleted during normal operation |
+| `manifest/CURRENT` | Authoritative database head and visibility boundary | Updated with conditional writes; never deleted during normal operation; retained permanently as the tombstone after destruction |
 | `manifest/snapshots/` | Complete metadata checkpoints used to bound database-open work | Immutable; old snapshots are reclaimed by maintenance |
 | `manifest/pages/` | Immutable pages of committed manifest history | Immutable; unreachable pages are reclaimed by maintenance |
 | `maintenance/HEAD` | Coordination mailbox between maintenance and the writer | Bounded mutable object; never swept as ordinary data |
@@ -95,7 +95,9 @@ contains:
 - writer and maintenance fencing state;
 - the change-feed mode and retained feed floor, when enabled;
 - the maximum lifetime of a reader's pinned view;
-- bounded receipts used to make writer and maintenance retries idempotent.
+- bounded receipts used to make writer and maintenance retries idempotent;
+- the irreversible lifecycle state and destruction record of a destroyed
+  database, when one exists.
 
 The current format is:
 
@@ -244,6 +246,49 @@ mailbox.
 Readers never need `maintenance/HEAD`. Users normally interact with this flow
 through the public maintenance API described in the [API guide](../api.md), not
 through the JSON object.
+
+## Database destruction
+
+Taking a tenant prefix permanently offline uses the public `Destroy` /
+`DestroyBucket` API. Destruction never reinterprets a missing or corrupt
+`CURRENT`: an uninitialized prefix and a non-empty prefix that lost its head
+both fail closed and are not destroyed.
+
+`CURRENT` carries an irreversible lifecycle state. One conditional update
+commits `lifecycle: "destroyed"` together with a small destruction record and
+clears the writer and compactor fences in the same CAS, so ownership
+invalidation and the terminal marker become visible atomically. From that
+commit onward:
+
+- every new `Open`, `OpenWriter`, `OpenReader`, `OpenChangeReader`, and
+  `OpenMaintenance` returns a stable `database destroyed` error;
+- stale writer or maintenance processes cannot update `CURRENT` or
+  `maintenance/HEAD`; fence-claim, append, and maintenance-application paths
+  all reject the terminal state even if the process never reloaded;
+- reader refreshes fail without replacing the already-loaded view. An existing
+  Reader, Snapshot, or Iterator keeps serving its pinned view until that
+  view's existing `MaxPinnedViewAge` boundary, after which all operations
+  converge to the same terminal error.
+
+Physical deletion happens in two resumable, idempotent phases:
+
+1. Control objects (`maintenance/HEAD` and everything below `manifest/gc/`)
+   are removed immediately after the terminal commit.
+2. SSTs, change batches, manifest snapshots, and manifest pages are deleted in
+   bounded batches only after `destroyed_at + max_pinned_view_age`, so views
+   loaded before teardown keep their existing safety window.
+
+The destruction record in `CURRENT` stores a lexicographic sweep cursor that is
+advanced only after a deletion batch fully succeeds. Listings restart at the
+prefix root after a crash and skip keys at or below the cursor; repeated
+deletes are no-ops, so partial batch failures, interrupted listings, and
+process exits are all resolved by repeating the same `Destroy` call. A terminal
+commit whose response was lost is recognized by re-reading `CURRENT`.
+
+The terminal `CURRENT` is never deleted. It is the retained tombstone: the
+prefix can never reopen as an empty/new database, cannot be republished, and
+repeated `Destroy` calls report the durable terminal state. After the sweep
+completes, `CURRENT` is the only object left under the prefix.
 
 ## Garbage-collection records
 

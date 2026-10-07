@@ -284,9 +284,23 @@ func (s *Store) ReadMaintenanceHead(ctx context.Context) (*MaintenanceHead, stri
 	return head, etag, err
 }
 
+// ensureMaintenanceCurrentActive fails maintenance ownership and mailbox
+// updates once CURRENT is destroyed. Maintenance HEAD has no independent
+// lifecycle: stale commands must not be able to write it after teardown.
+func (s *Store) ensureMaintenanceCurrentActive(ctx context.Context) error {
+	current, err := s.readCurrentData(ctx)
+	if err != nil {
+		return err
+	}
+	return ensureActiveCurrent(current)
+}
+
 func (s *Store) ClaimMaintenance(ctx context.Context, ownerID string) (*FenceToken, error) {
 	if ownerID == "" {
 		return nil, fmt.Errorf("empty maintenance owner")
+	}
+	if err := s.ensureMaintenanceCurrentActive(ctx); err != nil {
+		return nil, err
 	}
 	for attempt := 0; attempt < currentCASMaxRetries; attempt++ {
 		head, etag, err := s.ReadMaintenanceHead(ctx)
@@ -323,6 +337,9 @@ func (s *Store) ClaimMaintenance(ctx context.Context, ownerID string) (*FenceTok
 }
 
 func (s *Store) StageMaintenance(ctx context.Context, command MaintenanceCommand, token *FenceToken) (*MaintenanceHead, error) {
+	if err := s.ensureMaintenanceCurrentActive(ctx); err != nil {
+		return nil, err
+	}
 	head, etag, err := s.ReadMaintenanceHead(ctx)
 	if err != nil {
 		return nil, err
@@ -360,6 +377,9 @@ func (s *Store) StageMaintenance(ctx context.Context, command MaintenanceCommand
 }
 
 func (s *Store) ClearMaintenance(ctx context.Context, commandID string, epoch, generation uint64, token *FenceToken) (*MaintenanceHead, error) {
+	if err := s.ensureMaintenanceCurrentActive(ctx); err != nil {
+		return nil, err
+	}
 	head, etag, err := s.ReadMaintenanceHead(ctx)
 	if err != nil {
 		return nil, err
@@ -416,6 +436,10 @@ func (s *Store) ApplyPendingMaintenance(ctx context.Context) (MaintenanceApplyRe
 	for attempt := 0; attempt < currentCASMaxRetries; attempt++ {
 		current, etag, err := s.readCurrentWithETag(ctx)
 		if err != nil {
+			return MaintenanceApplyResult{}, err
+		}
+		if err := ensureActiveCurrent(current); err != nil {
+			s.invalidateLocalFences()
 			return MaintenanceApplyResult{}, err
 		}
 		if err := s.checkFenceWithCurrent(FenceRoleWriter, current); err != nil {
