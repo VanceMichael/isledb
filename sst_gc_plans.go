@@ -683,6 +683,14 @@ func (c *sstCleaner) runOrphanAudit(
 	}
 	stats.Attempted += len(deleteKeys)
 	if err := c.delete.BatchDelete(ctx, deleteKeys); err != nil {
+		if pinned, ok := isBackupPinnedError(err); ok {
+			// A backup view can legitimately pin an object that this audit
+			// classified as an orphan. Retain every candidate and re-prove the
+			// audit on a later pass after the lease is gone.
+			stats.Attempted -= len(deleteKeys)
+			stats.Deferred += len(pinned.protected)
+			return stats, nil
+		}
 		if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
 			return stats, cancelErr
 		}
@@ -908,6 +916,18 @@ func reclaimSSTDeletionPlans(
 			remaining -= len(keys)
 		}
 		if err := deleteObjects.BatchDelete(ctx, keys); err != nil {
+			if pinned, ok := isBackupPinnedError(err); ok {
+				// An active online backup lease still protects plan targets,
+				// including when the durable deletion plan predates the lease.
+				// Preserve the consumed ready record and retry the whole plan
+				// after release or expiry; plan bookkeeping must not be removed
+				// while any target remains.
+				stats.Deferred += len(pinned.protected)
+				if pendingPlanKey != nil {
+					*pendingPlanKey = object.Key
+				}
+				return stats, false, false, nil
+			}
 			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
 				return stats, false, true, errors.Join(reclaimErr, cancelErr)
 			}

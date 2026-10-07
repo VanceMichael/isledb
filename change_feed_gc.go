@@ -542,6 +542,16 @@ func reclaimChangeFeedDeletionPlans(
 			remaining -= len(keys)
 		}
 		if err := deleter.BatchDelete(ctx, keys); err != nil {
+			if pinned, ok := isBackupPinnedError(err); ok {
+				// Active backup leases pin change batches required by older
+				// generations, even when the durable retention plan predates
+				// the lease. Keep the ready record and retry after release.
+				stats.Deferred += len(pinned.protected)
+				if pendingPlanKey != nil {
+					*pendingPlanKey = object.Key
+				}
+				return stats, false, false, nil
+			}
 			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
 				return stats, false, true, errors.Join(reclaimErr, cancelErr)
 			}

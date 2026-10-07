@@ -435,7 +435,8 @@ type Maintenance struct {
 	sstGC       *sstCleaner
 	snapshotGC  *snapshotCleaner
 	pageGC      *manifestPageCleaner
-	deleter     *limitedObjectDeleter
+	deleter     objectDeleter
+	backupGuard *backupLeaseGuard
 	fenceToken  *manifest.FenceToken
 
 	lifecycleMu   sync.Mutex
@@ -469,9 +470,13 @@ func newMaintenance(
 	manifestLog *manifest.Store,
 	opts MaintenanceOptions,
 	sstOutput SSTEncodingOptions,
+	guard *backupLeaseGuard,
 ) (*Maintenance, error) {
 	if err := checkContext(ctx); err != nil {
 		return nil, err
+	}
+	if guard == nil {
+		guard = newBackupLeaseGuard(store, nil)
 	}
 	normalized, err := normalizeMaintenanceOptions(opts)
 	if err != nil {
@@ -497,7 +502,10 @@ func newMaintenance(
 		return nil, fmt.Errorf("claim maintenance fence: %w", err)
 	}
 
-	deleter := newLimitedObjectDeleter(store, normalized.reclamation.MaxConcurrentDeletes)
+	deleteLimiter := newLimitedObjectDeleter(store, normalized.reclamation.MaxConcurrentDeletes)
+	// Every physical reclamation delete passes through the backup lease guard
+	// before reaching the rate-limited store deleter.
+	deleter := newLeaseGuardedDeleter(deleteLimiter, guard)
 	m := &Maintenance{
 		manifestLog: manifestLog,
 		opts:        normalized,
@@ -518,7 +526,8 @@ func newMaintenance(
 			OrphanAuditEvery: normalized.reclamation.Manifest.AuditInterval,
 			Deleter:          deleter,
 		}),
-		deleter:    deleter,
+		deleter:     deleter,
+		backupGuard: guard,
 		fenceToken: token,
 		runGate:    make(chan struct{}, 1),
 		reclaimGates: map[ReclamationFamily]chan struct{}{
@@ -972,6 +981,12 @@ func (m *Maintenance) runReclamationPass(
 		return stats, schedule, err
 	}
 	defer m.finishReclamation(family)
+	// Load the active backup-lease set lazily but exactly once for this pass:
+	// the first guarded data-object delete triggers the read. A pass that
+	// performs no deletion therefore adds no backup-related I/O.
+	if m.backupGuard != nil {
+		m.backupGuard.beginPass()
+	}
 
 	switch family {
 	case ReclamationSST:

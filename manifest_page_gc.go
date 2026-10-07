@@ -450,6 +450,12 @@ func (c *manifestPageCleaner) sweep(ctx context.Context, now time.Time) (Manifes
 
 		stats.DeleteAttempts++
 		if err := c.delete.Delete(ctx, mark.Page.Path); err != nil {
+			if _, ok := isBackupPinnedError(err); ok {
+				// A backup view still pins this page; keep its marker and
+				// retry physical deletion after the lease ends.
+				stats.Deferred++
+				continue
+			}
 			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
 				c.resetMarkerIterator(iter)
 				return stats, cancelErr

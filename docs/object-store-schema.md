@@ -39,6 +39,14 @@ demo/p000/
         <plan-id>.json
       pages/ready/
         <not-before>-<plan-id>.json
+    backup/
+      views/
+        <generation-sha>/
+          current
+          root.json
+          chunks/<family>/<index>.json
+      leases/
+        <lease-id>.json
   maintenance/
     HEAD
   sstable/
@@ -61,6 +69,7 @@ usually do not exist because object stores expose keys, not real directories.
 | `sstable/` | Immutable key-value data files | Reclaimed after compaction or explicit history removal makes them unreachable |
 | `changes/` | Immutable ordered mutation batches | Reclaimed according to configured change-feed retention |
 | `manifest/gc/` | Durable, bounded proof and work records for safe physical deletion | Created and removed by maintenance |
+| `manifest/backup/` | Online backup views (pinned generations and stable object manifests) and their persistent leases | Created by `BeginBackup`; leases are renewed, released, or expire; reclamation never deletes view objects |
 
 ## What makes data visible
 
@@ -290,8 +299,63 @@ deleted can leave unreachable data in the bucket indefinitely.
 
 ## Backup and restore
 
+### Online backup views
+
+An online backup captures one committed database generation while the writer,
+reader, and maintenance keep running. `DB.BeginBackup` reads `CURRENT` exactly
+once and persists, below `manifest/backup/`:
+
+- an immutable copy of that generation's `CURRENT` (`views/<sha>/current`);
+- a stable, checksummed object manifest (`root.json` plus deterministic
+  `chunks/`) enumerating the pinned `CURRENT`, its reachable manifest snapshot,
+  every reachable manifest page, every live SST, and every change batch still
+  required by the generation;
+- a persistent lease (`leases/<lease-id>.json`) with an explicit expiry.
+
+The manifest never changes for the lease: later writes, checkpoints,
+compaction, and retention neither add nor remove rows. Each row carries the
+exact object key together with size and/or SHA-256 information, so a copy
+agent can verify every copied object independently. The manifest is paged
+deterministically; the opaque page cursor and the caller-persisted recovery
+token both resume the same manifest after a process restart, without
+recapturing a newer generation or drifting to different objects.
+
+The lease must be renewed while copying and released when copying completes.
+If a process dies, the lease expires at its recorded deadline. While a lease
+is active, every physical reclamation lane—SST retirement plans, change-feed
+retention plans, snapshot retirement markers, manifest-page range plans and
+markers, including orphan audits—checks the current lease set immediately
+before deleting and preserves any object listed by an active view. This also
+covers work whose deletion plan became durable before the lease existed:
+deletion plans are immutable proof, but physical removal always re-reads the
+lease state. When the lease is released or expires, the existing plans resume
+and delete the objects that remain unreachable; no backup-specific sweep is
+needed to restore the original reclamation behavior.
+
+Restore procedure for an online backup:
+
+1. Persist the recovery token returned by `BeginBackup`.
+2. Page through the stable manifest and copy every listed object.
+3. Write the pinned `CURRENT` row back to its logical key `manifest/CURRENT`
+   (the row's `logical_path`). Every other object is restored at its listed
+   key under the same prefix.
+4. Release the lease after all copies are durable.
+
+`maintenance/HEAD` and `manifest/gc/` work records are not part of a view:
+they coordinate future maintenance, not the committed generation, and may be
+omitted from the restored copy. Do not copy `manifest/backup/` itself into a
+restored database; those objects are bookkeeping for the backup session.
+
+With no active leases, maintenance performs no lease-object reads while
+idle: lease state is loaded lazily, once per reclamation pass that actually
+removes data.
+
+### Full-prefix, stop-the-world backup
+
 A database backup must include the complete database prefix, including
 `manifest/`, `maintenance/`, `sstable/`, `changes/`, and `manifest/gc/`.
+This mechanism remains supported unchanged for environments that pause
+services during backup.
 
 For a simple consistent backup:
 
@@ -317,6 +381,9 @@ those provider-owned versions or uploads separately.
 - Give maintenance read access to the database, conditional-write access to
   `maintenance/HEAD`, and the list, create, and delete permissions required by
   its configured compaction and reclamation work.
+- Give online backup agents read access to `manifest/`, `sstable/`, and
+  `changes/`, plus list and conditional-create/write access to
+  `manifest/backup/`. Agents never write outside that namespace.
 - Do not apply a generic age-based delete rule to live IsleDB prefixes.
 - Do not rename, rewrite, or manually remove immutable objects.
 - Treat a missing object referenced by `CURRENT` as corruption or premature

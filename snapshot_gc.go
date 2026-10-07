@@ -453,6 +453,12 @@ func (c *snapshotCleaner) sweep(ctx context.Context, now time.Time) (ManifestSna
 
 		stats.DeleteAttempts++
 		if err := c.delete.Delete(ctx, mark.Path); err != nil {
+			if _, ok := isBackupPinnedError(err); ok {
+				// An active backup view still requires this snapshot. Its
+				// marker must survive so deletion is retried after release.
+				stats.Deferred++
+				continue
+			}
 			if cancelErr := reclamationCancellation(ctx, err); cancelErr != nil {
 				c.resetMarkerIterator(iter)
 				return stats, cancelErr

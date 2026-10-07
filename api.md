@@ -19,6 +19,7 @@ import "github.com/ankur-anand/isledb"
 - [Read key-value data](#read-key-value-data)
 - [Enable and consume the change feed](#enable-and-consume-the-change-feed)
 - [Run maintenance separately](#run-maintenance-separately)
+- [Back up a database online](#back-up-a-database-online)
 - [Prometheus metrics](#prometheus-metrics)
 - [Error reference](#error-reference)
 - [Advanced blobstore package](#advanced-blobstore-package)
@@ -1152,6 +1153,110 @@ type ManifestPageCleanupStats struct {
 Use `OnCycle` for serialized control work and `OnReclamationCycle` for the
 independent physical lanes.
 
+## Back up a database online
+
+An online backup pins one committed database generation while writes,
+checkpoints, compaction, and physical reclamation continue. Pinned objects are
+protected by a durable object-store lease for the backup lifetime.
+
+```go
+type BackupOptions struct {
+    Owner          string        // diagnostic agent label
+    IdempotencyKey string        // optional: makes Begin retry-safe across restarts
+    LeaseTTL       time.Duration // default 24h, clamped to [1m, 168h]
+}
+
+func (db *DB) BeginBackup(ctx context.Context, opts BackupOptions) (*Backup, error)
+func (db *DB) OpenBackup(ctx context.Context, token BackupToken) (*Backup, error)
+```
+
+`BeginBackup` reads `manifest/CURRENT` exactly once and builds a stable object
+manifest for that generation: the pinned `CURRENT`, its reachable manifest
+snapshot and pages, every live SST, and every change batch the generation
+still requires. Repeating `BeginBackup` with the same
+`(Owner, IdempotencyKey)` pair, even in another process and after newer
+commits, adopts the first durable lease instead of capturing a newer
+generation.
+
+```go
+backup, err := db.BeginBackup(ctx, isledb.BackupOptions{
+    Owner:          "nightly-snapshot",
+    IdempotencyKey: jobID,
+})
+if err != nil {
+    return err
+}
+
+// Persist this token before starting the copy. It is the only state required
+// to resume after a process restart.
+token, _ := backup.Token()
+
+var cursor *isledb.BackupListCursor
+for {
+    objects, next, err := backup.ListObjects(ctx, 256, cursor)
+    if err != nil {
+        return err
+    }
+    for _, object := range objects {
+        // Copy object.Path from the object store to the backup destination.
+        // object.Size and/or object.Checksum let you verify the copy.
+    }
+    if next == nil {
+        break
+    }
+    cursor = next
+}
+
+_ = backup.Release(ctx)
+```
+
+`ListObjects` is deterministically paged. The sequence never changes for the
+view: later writes, checkpoints, compaction, retention, and process restarts
+neither add, drop, nor reorder rows. A row's `Path` is the exact key to copy.
+The first row is the pinned `CURRENT`; restore it at its `LogicalPath`
+(`manifest/CURRENT`) under the same prefix. Every other row is restored at its
+`Path`.
+
+```go
+type BackupObject struct {
+    Kind         BackupObjectKind // current, manifest_snapshot, manifest_page, sstable, change_batch
+    Path         string
+    LogicalPath  string // restore destination for the pinned CURRENT row
+    Size         int64  // payload length for SST and change-batch objects
+    EncodedBytes uint64 // exact encoded length for manifest objects
+    Checksum     string // sha256:<hex>
+}
+```
+
+Manage the durable lease around the copy:
+
+```go
+func (b *Backup) Renew(ctx context.Context, ttl time.Duration) (time.Time, error)
+func (b *Backup) Release(ctx context.Context) error
+func (b *Backup) ExpiredAt(now time.Time) bool
+func (b *Backup) Info() BackupInfo
+```
+
+Renew before the copy exceeds the TTL. Release is idempotent. If a process
+dies, the lease expires automatically. While a lease is active, maintenance
+does not physically delete any SST, change batch, manifest snapshot, or
+manifest page listed by the view, including objects whose deletion plans were
+durable before the lease began. After release or expiry, ordinary reclamation
+resumes without intervention. When no backup lease exists, Writer, Reader,
+ChangeReader, and Maintenance keep their prior behavior and request
+boundaries: maintenance only consults lease state in a pass that actually
+deletes data.
+
+Resume after a restart by reopening the database and loading the persisted
+token; the manifest continues from the same position:
+
+```go
+tokenText := token.String() // persist this
+// ... new process ...
+resumeToken, err := isledb.DecodeBackupToken(tokenText)
+backup, err = db.OpenBackup(ctx, resumeToken) // ErrBackupLeaseExpired / ErrBackupLeaseReleased when inactive
+```
+
 ## Prometheus metrics
 
 ```go
@@ -1222,6 +1327,16 @@ if errors.Is(err, isledb.ErrBackpressure) {
 | `ErrInvalidChangeReadOptions` | Negative page limit |
 | `ErrCorruptChangeFeed` | Manifest feed metadata is inconsistent |
 | `ErrCorruptChangeBatch` | Change-batch index, block, or checksum is invalid |
+
+### Online backup
+
+| Error | Meaning |
+|---|---|
+| `ErrBackupLeaseNotFound` | No durable lease exists for the supplied token |
+| `ErrBackupLeaseExpired` | The lease reached its expiry; the copy window is closed |
+| `ErrBackupLeaseReleased` | The lease was explicitly released; renewal is rejected |
+| `ErrBackupLeaseConflict` | A lease id resolves to a different backup view |
+| `ErrBackupTokenInvalid` | Malformed token, cursor, TTL, or idempotency input |
 
 ### Maintenance
 

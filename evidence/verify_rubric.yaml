@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: "开始备份原子固定一个已提交 CURRENT 代际，后续 Writer 提交、checkpoint 或压缩不会改变该备份的身份、清单内容和顺序。"
+  - id: 2
+    type: f2p
+    text: "清单完整覆盖恢复该代际所需的 CURRENT、可达 snapshot/page、SST 和 change batch，并为每个对象提供可验证路径及大小或校验信息；按清单恢复后可打开并读取同一数据与变更流边界。"
+  - id: 3
+    type: f2p
+    text: "清单分页顺序确定，持久恢复令牌在客户端或进程重启后继续同一清单；中途失败重试不会重新捕获新代际、跳过对象或产生跨代际重复。"
+  - id: 4
+    type: f2p
+    text: "备份租约持久存储并支持续期；有效租约对进程重启和未知写入结果可恢复，备份代理可重读状态确认保护是否生效。"
+  - id: 5
+    type: f2p
+    text: "SST、change-feed、snapshot 和 manifest-page 的物理删除在最终删除前都检查有效备份保护，计划删除与租约建立并发时也不会移除清单所需对象。"
+  - id: 6
+    type: f2p
+    text: "显式释放具有幂等结果，租约过期也能解除保护；释放、续期或删除遇到部分失败及重启后最终收敛，原有各类回收器随后可继续回收。"
+  - id: 7
+    type: p2p
+    text: "无活动备份时 Writer、Reader、Snapshot、ChangeReader、Maintenance、MaxPinnedViewAge、正常回收和既有停机复制流程保持兼容，不要求外部云服务或全局暂停。"

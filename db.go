@@ -190,6 +190,13 @@ type DB struct {
 	storePolicy     StorePolicy
 	sstOutput       SSTOutputOptions
 
+	// backupGuard backs the online backup lease checks shared by every
+	// physical reclamation lane. It performs no I/O until a deletion pass
+	// actually removes data objects.
+	backupGuard *backupLeaseGuard
+	// backupClock is overridden in deterministic tests only.
+	backupClock func() time.Time
+
 	mu              sync.Mutex
 	closers         []dbCloser
 	writerOpen      bool
@@ -263,6 +270,7 @@ func openDB(ctx context.Context, store *blobstore.Store, opts dbOpenOptions) (*D
 		maintenanceWake: make(chan struct{}, 1),
 		storePolicy:     storePolicy,
 		sstOutput:       sstOutput,
+		backupGuard:     newBackupLeaseGuard(store, nil),
 	}, nil
 }
 
@@ -419,6 +427,7 @@ func (db *DB) OpenMaintenance(ctx context.Context, opts MaintenanceOptions) (*Ma
 		db.manifestStore,
 		opts,
 		db.sstOutput.Compacted,
+		db.backupGuard,
 	)
 	if err != nil {
 		db.releaseMaintenance(nil)

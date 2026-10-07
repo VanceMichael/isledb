@@ -1,0 +1,9 @@
+项目：ankur-anand-isledb-baba8a3e-763d-4226-b776-1fb72216e1b7；固定版本：d97eb7a931aaa78291ec928648f0c4b7c240d191；运行轮数：89；验证：go test -count=1 ./...
+Rubric ID：1｜状态：通过｜期望行为：开始备份固定一个已提交 CURRENT 代际，后续写入和压缩不改变身份、清单和顺序｜实际观察：BeginBackup 只读取一次 CURRENT，captureBackupView 生成 viewID、root 和分族清单；测试在备份后继续写入并逐项比较清单未变化｜直接证据：backup.go:425-500；backup_test.go:94-227
+Rubric ID：2｜状态：通过｜期望行为：清单覆盖 CURRENT、snapshot/page、SST 和 change batch，并带可验证路径及校验信息｜实际观察：fullgraph 测试枚举并校验所有对象，恢复所需四类对象均出现且 checksum、size 或 encoded bytes 可验证｜直接证据：backup_view.go:173-350；backup_test.go:228-343
+Rubric ID：3｜状态：通过｜期望行为：分页顺序确定，持久 token 在重启后继续同一清单，中途失败不跨代际｜实际观察：BackupListCursor 持有 viewID、family、chunk、offset；测试使用不同 pageSize 重排读取并在关闭重开后比较每一行｜直接证据：backup.go:254-400；backup_test.go:94-227
+Rubric ID：4｜状态：通过｜期望行为：租约持久、可续期，重启和未知结果可恢复并能重读保护状态｜实际观察：lease 使用对象存储 JSON 和 CAS；renew/release 重读冲突状态，幂等 begin 在提交后读取同一 lease；测试覆盖续期、过期和未知 PUT 收敛｜直接证据：backup_lease.go:180-333；backup_test.go:556-669、735-769
+Rubric ID：5｜状态：未通过｜期望行为：四类物理删除最终删除前都检查有效租约，租约建立与计划删除并发时不得删除清单对象｜实际观察：backupLeaseGuard 在每个回收 pass 的第一次删除前加载一次租约集合，之后 ensureLoaded 直接复用缓存；回收 pass 开始后新建租约不会进入该集合，leaseGuardedDeleter 随后可把受保护对象交给 base.BatchDelete｜直接证据：maintenance.go:984-989；backup_lease.go:397-415、611-657｜原因：租约保护检查不是删除瞬间的原子准入，建立租约与删除交错时存在先加载后建立再删除的确定缺口｜影响：活动备份的 SST、change batch、snapshot 或 page 在回收 pass 内可被删除｜证据位置：上述代码路径；现有测试只覆盖计划先存在再建立租约，未覆盖加载后建立租约的交错
+Rubric ID：6｜状态：通过｜期望行为：释放幂等、过期解除保护，部分失败和重启后最终收敛｜实际观察：release 使用 CAS 写入 released 状态，过期 lease 不再 active；guard 下一 pass 重新加载后允许回收；测试覆盖 release、expiry 和重启恢复｜直接证据：backup_lease.go:268-305、397-470；backup_test.go:344-438、607-669
+Rubric ID：7｜状态：通过｜期望行为：无活动备份时既有写读、维护、回收和停机复制保持兼容｜实际观察：go test -count=1 ./... 全部包通过；备份逻辑仅在 BeginBackup 或 guarded deletion 路径启用，非备份删除路径保持原 deleter｜直接证据：maintenance.go:505-530；backup_test.go:672-733；全量测试输出
+验证摘要：project-02 的 go test -count=1 ./... 通过；审计发现仅 Rubric 5 的租约建立后交错未被实现保护。

@@ -15,6 +15,11 @@ import (
 	"github.com/ankur-anand/isledb/internal/manifest"
 )
 
+// errManifestPagePlanPinned signals that a range plan skipped deletion
+// because an active backup lease protected one of its pages. It is a quiet
+// deferral: the plan stays active and is retried on a later pass.
+var errManifestPagePlanPinned = errors.New("manifest page plan deferred by active backup lease")
+
 const (
 	manifestPageDeletionPlanReadyPrefix     = "manifest/gc/pages/ready"
 	manifestPageDeletionPlanCanonicalPrefix = "manifest/gc/pages/plans"
@@ -391,6 +396,9 @@ func (c *manifestPageCleaner) reclaimPlans(
 		}
 		completed, processErr := c.reclaimActiveManifestPagePlan(ctx, currentFloor, &stats, &remaining)
 		if processErr != nil {
+			if errors.Is(processErr, errManifestPagePlanPinned) {
+				return stats, nil
+			}
 			return stats, processErr
 		}
 		if !completed {
@@ -537,6 +545,13 @@ func (c *manifestPageCleaner) reclaimActiveManifestPagePlan(
 		}
 		stats.DeleteAttempts++
 		if err := c.delete.Delete(ctx, object.Key); err != nil {
+			if _, ok := isBackupPinnedError(err); ok {
+				// An online backup lease still pins this page. The range plan
+				// and its bookkeeping stay active; completion is retried after
+				// the lease is released or expires.
+				stats.Deferred++
+				return false, errManifestPagePlanPinned
+			}
 			c.activePageIter = nil
 			return false, err
 		}
