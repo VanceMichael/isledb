@@ -64,9 +64,32 @@ type SSTMeta struct {
 	// Readers use it to fetch that region in one request. Zero means unknown.
 	MetaOffset int64 `json:"meta_offset,omitempty"`
 
+	// RangeDeletions summarizes the range deletion tombstones carried by this
+	// SST. Count is the number of tombstone records; MinKey is the smallest
+	// start key; MaxKey is the largest exclusive end key. These bounds extend
+	// the SST's coverage beyond its point keys, so readers must not use the
+	// point Bloom or point-only bounds to skip a possible covering tombstone.
+	// A zero value means the SST holds no range tombstones, as for every SST
+	// written before range deletions existed.
+	RangeDeletions RangeDeletionsMeta `json:"range_deletions,omitempty"`
+
 	// Level records the logical placement committed with this metadata. L0 is
 	// zero; compacted levels start at one.
 	Level uint32 `json:"level"`
+}
+
+// RangeDeletionsMeta is the bounded summary of the range tombstones owned by
+// one SST. It lets readers and planners discover a potential covering
+// tombstone without opening the range-deletion block.
+type RangeDeletionsMeta struct {
+	Count  int    `json:"count,omitempty"`
+	MinKey []byte `json:"min_key,omitempty"`
+	MaxKey []byte `json:"max_key,omitempty"`
+}
+
+// Empty reports whether the SST carries no range tombstones.
+func (m RangeDeletionsMeta) Empty() bool {
+	return m.Count == 0
 }
 
 // ChangeFeedPayload identifies which PUT payload is retained in committed

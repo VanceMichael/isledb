@@ -8,8 +8,9 @@ import (
 type OpKind byte
 
 const (
-	OpPut    OpKind = 1
-	OpDelete OpKind = 2
+	OpPut         OpKind = 1
+	OpDelete      OpKind = 2
+	OpRangeDelete OpKind = 3
 )
 
 const (

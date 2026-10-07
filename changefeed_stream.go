@@ -85,6 +85,18 @@ func (b *changeBatchBuffer) appendDelete(seq uint64, key []byte) error {
 	return b.appendRecord(changeRecord{Seq: seq, Kind: changeDelete, Key: key})
 }
 
+// appendRangeDelete records one range deletion [start, end) at seq. Both keys
+// are always retained, even in keys-only payload mode, because the end key is
+// required to apply the operation.
+func (b *changeBatchBuffer) appendRangeDelete(seq uint64, start, end []byte) error {
+	return b.appendRecord(changeRecord{
+		Seq:  seq,
+		Kind: changeRangeDelete,
+		Key:  start,
+		End:  end,
+	})
+}
+
 func (b *changeBatchBuffer) appendRecord(change changeRecord) error {
 	if b.payload == 0 {
 		if change.Kind == changePut && change.ValueOmitted {
@@ -109,6 +121,11 @@ func (b *changeBatchBuffer) appendRecord(change changeRecord) error {
 	valueLen := 0
 	switch change.Kind {
 	case changeDelete:
+	case changeRangeDelete:
+		if len(change.End) == 0 {
+			return errors.New("range delete end key must not be empty")
+		}
+		valueLen = len(change.End)
 	case changePut:
 		switch b.payload {
 		case ChangeFeedKeysOnly:
@@ -143,8 +160,13 @@ func (b *changeBatchBuffer) appendRecord(change changeRecord) error {
 	binary.BigEndian.PutUint64(header[24:32], uint64(change.ExpireAt))
 	b.appendBytes(header[:])
 	b.appendBytes(change.Key)
-	if change.Kind == changePut && !change.ValueOmitted {
-		b.appendBytes(change.Value)
+	switch change.Kind {
+	case changeRangeDelete:
+		b.appendBytes(change.End)
+	case changePut:
+		if !change.ValueOmitted {
+			b.appendBytes(change.Value)
+		}
 	}
 
 	if b.count == 0 {

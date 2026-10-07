@@ -8,11 +8,14 @@ import (
 	"github.com/ankur-anand/isledb/blobstore"
 	"github.com/ankur-anand/isledb/internal/cachestore"
 	"github.com/ankur-anand/isledb/internal/manifest"
+	"github.com/cockroachdb/pebble/v2/sstable"
 )
 
 type manifestState = manifest.Manifest
 type sstMetadata = manifest.SSTMeta
 type bloomMetadata = manifest.BloomMeta
+type sstRangeDeletionsMeta = manifest.RangeDeletionsMeta
+type sstInternalKey = sstable.InternalKey
 
 func resolveManifestStorage(store *blobstore.Store, storage manifest.Storage) manifest.Storage {
 	if storage != nil {

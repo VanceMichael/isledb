@@ -29,14 +29,16 @@ const (
 type changeKind byte
 
 const (
-	changePut    changeKind = changeKind(internal.OpPut)
-	changeDelete changeKind = changeKind(internal.OpDelete)
+	changePut         changeKind = changeKind(internal.OpPut)
+	changeDelete      changeKind = changeKind(internal.OpDelete)
+	changeRangeDelete changeKind = changeKind(internal.OpRangeDelete)
 )
 
 type changeRecord struct {
 	Seq          uint64
 	Kind         changeKind
 	Key          []byte
+	End          []byte
 	Value        []byte
 	ValueOmitted bool
 	ExpireAt     int64
@@ -365,6 +367,8 @@ func encodeChange(buf *bytes.Buffer, change changeRecord) error {
 	valueLen := 0
 	switch change.Kind {
 	case changeDelete:
+	case changeRangeDelete:
+		valueLen = len(change.End)
 	case changePut:
 		if change.ValueOmitted {
 			flags |= changeFlagValueOmitted
@@ -387,8 +391,13 @@ func encodeChange(buf *bytes.Buffer, change changeRecord) error {
 	writeU64(buf, change.Seq)
 	writeI64(buf, change.ExpireAt)
 	buf.Write(change.Key)
-	if change.Kind == changePut && flags == 0 {
-		buf.Write(change.Value)
+	switch change.Kind {
+	case changeRangeDelete:
+		buf.Write(change.End)
+	case changePut:
+		if flags == 0 {
+			buf.Write(change.Value)
+		}
 	}
 	return nil
 }
@@ -421,6 +430,12 @@ func decodeChange(data []byte, off int) (changeRecord, int, error) {
 		if flags != 0 || valueLen != 0 {
 			return changeRecord{}, 0, errors.New("invalid delete change payload")
 		}
+	case changeRangeDelete:
+		if flags != 0 || valueLen == 0 {
+			return changeRecord{}, 0, errors.New("invalid range delete change payload")
+		}
+		change.End = data[off : off+int(valueLen)]
+		off += int(valueLen)
 	case changePut:
 		switch flags {
 		case 0:

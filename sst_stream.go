@@ -1,6 +1,7 @@
 package isledb
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -118,6 +119,7 @@ type streamSSTResult struct {
 func writeSSTStreaming(
 	ctx context.Context,
 	it sstIterator,
+	tombstones []internal.RangeTombstone,
 	opts sstWriterOptions,
 	identity sstStreamIdentity,
 	uploadFn func(ctx context.Context, sstID string, r io.Reader) error,
@@ -129,6 +131,10 @@ func writeSSTStreaming(
 		return result, errors.New("incomplete SST stream identity")
 	}
 
+	// Fragment before the pipe starts: fragmentation is deterministic and its
+	// output is the only range data the producer goroutine needs.
+	fragments := fragmentRangeTombstones(tombstones)
+
 	pr, pw := io.Pipe()
 	writable := newHashingWritable(pw)
 	bloomKeys := newSSTBloomKeys(opts.BloomBitsPerKey)
@@ -139,10 +145,11 @@ func writeSSTStreaming(
 	state := newSSTBuildState()
 
 	type producerResult struct {
-		state      *sstBuildState
-		bloom      bloomMetadata
-		metaOffset int64
-		err        error
+		state       *sstBuildState
+		bloom       bloomMetadata
+		metaOffset  int64
+		rangeResult rangeAddResult
+		err         error
 	}
 	producerDone := make(chan producerResult, 1)
 
@@ -231,7 +238,17 @@ func writeSSTStreaming(
 			return fmt.Errorf("sst producer: %w", err)
 		}
 
-		if !state.found {
+		// Range tombstones are independent of point ordering; add them before
+		// the empty check and Close so tombstone-only SSTs are valid.
+		rangeResult, rangeErr := addRangeFragments(sst, fragments)
+		if rangeErr != nil {
+			writable.Abort()
+			_ = sst.Close()
+			producerDone <- producerResult{err: rangeErr}
+			pw.CloseWithError(rangeErr)
+			return fmt.Errorf("sst producer: %w", rangeErr)
+		}
+		if !state.found && rangeResult.records == 0 {
 			writable.Abort()
 			_ = sst.Close()
 			producerDone <- producerResult{err: errEmptyIterator}
@@ -264,9 +281,10 @@ func writeSSTStreaming(
 		}
 
 		producerDone <- producerResult{
-			state:      state,
-			metaOffset: metaOffset,
-			bloom:      bloom,
+			state:       state,
+			metaOffset:  metaOffset,
+			bloom:       bloom,
+			rangeResult: rangeResult,
 		}
 		return nil
 	})
@@ -282,18 +300,20 @@ func writeSSTStreaming(
 	hashBytes := writable.sumBytes()
 	hashStr := hex.EncodeToString(hashBytes)
 
+	seqLo, seqHi := unionSeqBounds(pResult.state, pResult.rangeResult)
 	result.Meta = sstMetadata{
-		ID:         identity.ID,
-		Epoch:      identity.Epoch,
-		SeqLo:      pResult.state.seqLo,
-		SeqHi:      pResult.state.seqHi,
-		MinKey:     pResult.state.minKey,
-		MaxKey:     pResult.state.maxKey,
-		Size:       writable.size,
-		Checksum:   "sha256:" + hashStr,
-		Bloom:      pResult.bloom,
-		CreatedAt:  identity.CreatedAt,
-		MetaOffset: pResult.metaOffset,
+		ID:             identity.ID,
+		Epoch:          identity.Epoch,
+		SeqLo:          seqLo,
+		SeqHi:          seqHi,
+		MinKey:         minBytesOr(pResult.state.minKey, pResult.rangeResult.minKey),
+		MaxKey:         maxBytesOr(pResult.state.maxKey, pResult.rangeResult.maxKey),
+		Size:           writable.size,
+		Checksum:       "sha256:" + hashStr,
+		Bloom:          pResult.bloom,
+		CreatedAt:      identity.CreatedAt,
+		MetaOffset:     pResult.metaOffset,
+		RangeDeletions: pResult.rangeResult.meta(),
 	}
 
 	return result, nil
@@ -302,9 +322,16 @@ func writeSSTStreaming(
 // writeMultipleSSTsStreaming builds and uploads multiple SSTs using streaming.
 // Each SST is streamed to the upload function as it's built, with new SSTs
 // started when the current one reaches targetSize.
+//
+// Range tombstones are fragmented independently of the point stream and
+// distributed across outputs at output key boundaries: a tombstone spanning a
+// split is cut at the next output's first point key, so each fragment lands in
+// the output whose key coverage it belongs to. Tail fragments beyond the last
+// point are emitted by the final output and extend its manifest bounds.
 func writeMultipleSSTsStreaming(
 	ctx context.Context,
 	it sstIterator,
+	tombstones []internal.RangeTombstone,
 	opts sstWriterOptions,
 	identity sstStreamSetIdentity,
 	targetSize int64,
@@ -313,6 +340,9 @@ func writeMultipleSSTsStreaming(
 	defer func() {
 		err = errors.Join(err, it.Close())
 	}()
+
+	// Fragment once before any output starts.
+	fragments := fragmentRangeTombstones(tombstones)
 
 	wo := pebbleWriterOptions(opts)
 
@@ -328,12 +358,44 @@ func writeMultipleSSTsStreaming(
 	var uploadCancel context.CancelFunc
 	var started bool
 	var sstIndex int
+	var fragCursor int
+	var splitPending bool
 
 	getUploadErr := func() error {
 		if v := uploadErr.Load(); v != nil {
 			return v.(error)
 		}
 		return nil
+	}
+
+	// assignFragments returns the fragment portions that belong to the output
+	// about to be closed. boundary is the first point key of the next output;
+	// final means the last output, which also receives tail fragments.
+	assignFragments := func(boundary []byte, final bool) []fragmentedRange {
+		var assigned []fragmentedRange
+		for fragCursor < len(fragments) {
+			fragment := fragments[fragCursor]
+			if !final && bytes.Compare(fragment.start, boundary) >= 0 {
+				break
+			}
+			if !final && bytes.Compare(fragment.end, boundary) > 0 {
+				// The portion before boundary belongs here; the remainder stays
+				// in the cursor for the next output.
+				assigned = append(assigned, fragmentedRange{
+					start: append([]byte(nil), fragment.start...),
+					end:   append([]byte(nil), boundary...),
+					seqs:  append([]uint64(nil), fragment.seqs...),
+				})
+				break
+			}
+			assigned = append(assigned, fragmentedRange{
+				start: append([]byte(nil), fragment.start...),
+				end:   append([]byte(nil), fragment.end...),
+				seqs:  append([]uint64(nil), fragment.seqs...),
+			})
+			fragCursor++
+		}
+		return assigned
 	}
 
 	startNewSST := func() error {
@@ -366,9 +428,19 @@ func writeMultipleSSTsStreaming(
 		return nil
 	}
 
-	finishCurrentSST := func() error {
+	finishCurrentSST := func(boundary []byte, final bool) error {
 		if !started {
 			return nil
+		}
+
+		// Add assigned tombstone portions before Close.
+		assigned := assignFragments(boundary, final)
+		rangeResult, rangeErr := addRangeFragments(sst, assigned)
+		if rangeErr != nil {
+			pw.CloseWithError(rangeErr)
+			uploadCancel()
+			<-uploadDone
+			return rangeErr
 		}
 
 		if err := sst.Close(); err != nil {
@@ -405,19 +477,21 @@ func writeMultipleSSTsStreaming(
 		hashBytes := writable.sumBytes()
 		hashStr := hex.EncodeToString(hashBytes)
 
+		seqLo, seqHi := unionSeqBounds(state, rangeResult)
 		result := streamSSTResult{
 			Meta: sstMetadata{
-				ID:         sstID,
-				Epoch:      identity.Epoch,
-				SeqLo:      state.seqLo,
-				SeqHi:      state.seqHi,
-				MinKey:     state.minKey,
-				MaxKey:     state.maxKey,
-				Size:       sstSize,
-				Checksum:   "sha256:" + hashStr,
-				Bloom:      bloom,
-				CreatedAt:  identity.CreatedAt.UTC(),
-				MetaOffset: metaOffset,
+				ID:             sstID,
+				Epoch:          identity.Epoch,
+				SeqLo:          seqLo,
+				SeqHi:          seqHi,
+				MinKey:         minBytesOr(state.minKey, rangeResult.minKey),
+				MaxKey:         maxBytesOr(state.maxKey, rangeResult.maxKey),
+				Size:           sstSize,
+				Checksum:       "sha256:" + hashStr,
+				Bloom:          bloom,
+				CreatedAt:      identity.CreatedAt.UTC(),
+				MetaOffset:     metaOffset,
+				RangeDeletions: rangeResult.meta(),
 			},
 		}
 
@@ -464,13 +538,23 @@ func writeMultipleSSTsStreaming(
 			return nil, err
 		}
 
+		e := it.Entry()
+
+		// A deferred split from the previous entry finishes that output using
+		// this entry's key as the boundary before a new output is opened.
+		if splitPending {
+			if err := finishCurrentSST(e.Key, false); err != nil {
+				return nil, err
+			}
+			splitPending = false
+		}
+
 		if !started {
 			if err := startNewSST(); err != nil {
 				return nil, err
 			}
 		}
 
-		e := it.Entry()
 		k := append([]byte(nil), e.Key...)
 		bloomKeys.add(k)
 
@@ -497,9 +581,8 @@ func writeMultipleSSTsStreaming(
 		state.updateBounds(k, e.Seq)
 
 		if writable.size >= targetSize {
-			if err := finishCurrentSST(); err != nil {
-				return nil, err
-			}
+			// Defer closing until the next entry provides the boundary key.
+			splitPending = true
 		}
 	}
 
@@ -508,13 +591,30 @@ func writeMultipleSSTsStreaming(
 		return nil, fmt.Errorf("sst producer: %w", err)
 	}
 
-	if started && state.found {
-		if err := finishCurrentSST(); err != nil {
+	switch {
+	case splitPending:
+		// Iterator ended immediately after the size threshold. Finish that
+		// output as the final output.
+		if err := finishCurrentSST(nil, true); err != nil {
 			return nil, err
 		}
-	} else if started {
+	case started && (state.found || fragCursor < len(fragments)):
+		if err := finishCurrentSST(nil, true); err != nil {
+			return nil, err
+		}
+	case started:
 		// IMP: Fix goroutine leak for exhausted iterator.
 		abortCurrentSST()
+	}
+
+	// Tombstone-only inputs produce no points but still need an output.
+	if !started && fragCursor < len(fragments) {
+		if err := startNewSST(); err != nil {
+			return nil, err
+		}
+		if err := finishCurrentSST(nil, true); err != nil {
+			return nil, err
+		}
 	}
 
 	if len(results) == 0 {

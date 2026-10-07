@@ -1,6 +1,7 @@
 package isledb
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"errors"
@@ -393,6 +394,58 @@ func (w *writer) delete(ctx context.Context, key []byte) error {
 	return nil
 }
 
+// deleteRange records a half-open [start, end) range tombstone. The tombstone
+// shares the strict writer sequence order: it hides points with seq <= its own
+// and remains invisible to points written afterwards.
+//
+// Bounds follow the same non-empty key rules as point mutations. An empty
+// interval, start == end, is a deterministic no-op: it succeeds without
+// consuming a sequence number and hides nothing. Empty bounds or start > end
+// return ErrInvalidMutation.
+func (w *writer) deleteRange(ctx context.Context, start, end []byte) (err error) {
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+	if err := w.ensureWritable(); err != nil {
+		return err
+	}
+	if len(start) == 0 || len(end) == 0 {
+		return fmt.Errorf("%w: empty range bound", ErrInvalidMutation)
+	}
+	if len(start) > w.opts.Values.MaxKeyBytes || len(end) > w.opts.Values.MaxKeyBytes {
+		return fmt.Errorf("%w: range bound size exceeds max %d",
+			ErrInvalidMutation, w.opts.Values.MaxKeyBytes)
+	}
+	switch bytes.Compare(start, end) {
+	case 0:
+		// Empty interval: nothing to hide and no sequence consumed.
+		return nil
+	case 1:
+		return fmt.Errorf("%w: start %q greater than end %q", ErrInvalidMutation, start, end)
+	}
+
+	w.mu.Lock()
+	if err := w.ensureCapacityLocked(); err != nil {
+		w.mu.Unlock()
+		return err
+	}
+	seq := w.seq + 1
+	if w.changeFeedPayload != 0 {
+		if w.changeBuffer == nil {
+			w.changeBuffer = &changeBatchBuffer{payload: w.changeFeedPayload}
+		}
+		if err := w.changeBuffer.appendRangeDelete(seq, start, end); err != nil {
+			w.mu.Unlock()
+			return err
+		}
+	}
+	w.seq = seq
+	w.memtable.DeleteRange(start, end, seq)
+	w.mu.Unlock()
+
+	return nil
+}
+
 func (w *writer) ensureCapacityLocked() error {
 	if err := w.ensureWritable(); err != nil {
 		return err
@@ -582,7 +635,8 @@ func (w *writer) flushPending(ctx context.Context, pending *pendingFlush) error 
 	}
 
 	buildSST := func(uploadCtx context.Context) (streamSSTResult, error) {
-		result, err := writeSSTStreaming(uploadCtx, pending.memtable.Iterator(), sstOpts,
+		result, err := writeSSTStreaming(uploadCtx, pending.memtable.Iterator(),
+			pending.memtable.RangeTombstones(), sstOpts,
 			pending.sstIdentity, uploadFn)
 		if err != nil {
 			return streamSSTResult{}, fmt.Errorf("stream sst: %w", err)

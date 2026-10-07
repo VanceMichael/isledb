@@ -15,10 +15,12 @@ const (
 )
 
 type Memtable struct {
-	sl    *skl.Skiplist
-	seqMu sync.Mutex
-	seqLo uint64
-	seqHi uint64
+	sl *skl.Skiplist
+
+	seqMu          sync.Mutex
+	seqLo          uint64
+	seqHi          uint64
+	rangeTombstones []RangeTombstone
 }
 
 func NewMemtable(arenaBytes int64) *Memtable {
@@ -46,7 +48,7 @@ func (m *Memtable) SeqHi() uint64 {
 func (m *Memtable) Empty() bool {
 	m.seqMu.Lock()
 	defer m.seqMu.Unlock()
-	return m.seqLo == ^uint64(0)
+	return m.seqLo == ^uint64(0) && len(m.rangeTombstones) == 0
 }
 
 func (m *Memtable) updateSeqBounds(seq uint64) {
@@ -92,8 +94,45 @@ func (m *Memtable) Delete(key []byte, seq uint64) {
 	m.sl.Put(ikey, y.ValueStruct{Value: encoded})
 }
 
+// DeleteRange records a [start, end) range tombstone at seq. The tombstone is
+// stored separately from the point skiplist so it never appears as a point at
+// start. The caller has already validated the bounds.
+func (m *Memtable) DeleteRange(start, end []byte, seq uint64) {
+	m.seqMu.Lock()
+	m.rangeTombstones = append(m.rangeTombstones, RangeTombstone{
+		Start: append([]byte(nil), start...),
+		End:   append([]byte(nil), end...),
+		Seq:   seq,
+	})
+	m.seqMu.Unlock()
+	m.updateSeqBounds(seq)
+}
+
+// RangeTombstones returns independent copies of every tombstone recorded since
+// this memtable was created.
+func (m *Memtable) RangeTombstones() []RangeTombstone {
+	m.seqMu.Lock()
+	defer m.seqMu.Unlock()
+
+	out := make([]RangeTombstone, len(m.rangeTombstones))
+	for i, tombstone := range m.rangeTombstones {
+		out[i] = RangeTombstone{
+			Start: append([]byte(nil), tombstone.Start...),
+			End:   append([]byte(nil), tombstone.End...),
+			Seq:   tombstone.Seq,
+		}
+	}
+	return out
+}
+
 func (m *Memtable) ApproxSize() int64 {
-	return m.sl.MemSize()
+	size := m.sl.MemSize()
+	m.seqMu.Lock()
+	for _, tombstone := range m.rangeTombstones {
+		size += tombstone.EncodedSize()
+	}
+	m.seqMu.Unlock()
+	return size
 }
 
 func (m *Memtable) TotalSize() int64 {

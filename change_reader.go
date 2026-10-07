@@ -41,6 +41,7 @@ type ChangeOperation uint8
 const (
 	ChangePut ChangeOperation = iota + 1
 	ChangeDelete
+	ChangeRangeDelete
 )
 
 func (op ChangeOperation) String() string {
@@ -49,6 +50,8 @@ func (op ChangeOperation) String() string {
 		return "put"
 	case ChangeDelete:
 		return "delete"
+	case ChangeRangeDelete:
+		return "range_delete"
 	default:
 		return "unknown"
 	}
@@ -59,8 +62,11 @@ type Change struct {
 	Sequence  uint64
 	Operation ChangeOperation
 	Key       []byte
-	Value     []byte
-	HasValue  bool
+	// RangeEnd is the exclusive end key for ChangeRangeDelete and nil for
+	// every other operation.
+	RangeEnd []byte
+	Value    []byte
+	HasValue bool
 	ExpiresAt time.Time
 }
 
@@ -965,9 +971,17 @@ func publicChange(change changeRecord, pageData *[]byte) Change {
 			value = []byte{}
 		}
 	}
+	var rangeEnd []byte
+	if change.Kind == changeRangeDelete {
+		endStart := len(*pageData)
+		*pageData = append(*pageData, change.End...)
+		endEnd := len(*pageData)
+		rangeEnd = (*pageData)[endStart:endEnd:endEnd]
+	}
 	result := Change{
 		Sequence: change.Seq,
 		Key:      key,
+		RangeEnd: rangeEnd,
 		Value:    value,
 		HasValue: hasValue,
 	}
@@ -976,6 +990,8 @@ func publicChange(change changeRecord, pageData *[]byte) Change {
 		result.Operation = ChangePut
 	case changeDelete:
 		result.Operation = ChangeDelete
+	case changeRangeDelete:
+		result.Operation = ChangeRangeDelete
 	}
 	if change.ExpireAt != 0 {
 		result.ExpiresAt = time.UnixMilli(change.ExpireAt)

@@ -143,6 +143,22 @@ func (w *Writer) Delete(ctx context.Context, key []byte) error {
 	return w.w.delete(ctx, key)
 }
 
+// DeleteRange deletes every key in the half-open range [start, end).
+//
+// The range tombstone shares one strict sequence order with point writes:
+// after it commits, points in [start, end) whose sequence is not later than
+// the tombstone are hidden, while later point writes in the same range
+// remain visible. Keys outside [start, end) are unaffected.
+//
+// A start equal to end is a deterministic no-op that consumes no sequence.
+// Empty bounds or a start greater than end return an error.
+//
+// Like Put, the tombstone is buffered first and becomes durable and visible
+// after a successful Flush, background flush, or Close.
+func (w *Writer) DeleteRange(ctx context.Context, start, end []byte) error {
+	return w.w.deleteRange(ctx, start, end)
+}
+
 // Flush synchronously publishes all currently buffered writes.
 //
 // Flush rotates the active memtable, writes all frozen memtables as SST files,

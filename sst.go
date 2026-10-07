@@ -28,6 +28,63 @@ type sstIterator interface {
 	Close() error
 }
 
+// rangeAddResult summarizes the range tombstones added to one SST writer.
+type rangeAddResult struct {
+	records int
+	minKey  []byte
+	maxKey  []byte
+	seqLo   uint64
+	seqHi   uint64
+}
+
+// addRangeFragments writes already-fragmented tombstones to sst using the
+// Pebble RangeDelete internal kind: key is the fragment start with its
+// sequence, value is the exclusive end key. Tombstones are independent of
+// point-key order, so callers may add them at any point before Close.
+func addRangeFragments(sst *sstable.Writer, fragments []fragmentedRange) (rangeAddResult, error) {
+	result := rangeAddResult{seqLo: ^uint64(0)}
+	for _, fragment := range fragments {
+		for _, seq := range fragment.seqs {
+			start := append([]byte(nil), fragment.start...)
+			end := append([]byte(nil), fragment.end...)
+			ikey := pebble.MakeInternalKey(start, pebble.SeqNum(seq), pebble.InternalKeyKindRangeDelete)
+			if err := sst.Raw().Add(ikey, end, false); err != nil {
+				return result, fmt.Errorf("add range tombstone: %w", err)
+			}
+
+			result.records++
+			if result.minKey == nil || bytes.Compare(fragment.start, result.minKey) < 0 {
+				result.minKey = append([]byte(nil), fragment.start...)
+			}
+			if result.maxKey == nil || bytes.Compare(fragment.end, result.maxKey) > 0 {
+				result.maxKey = append([]byte(nil), fragment.end...)
+			}
+			if seq < result.seqLo {
+				result.seqLo = seq
+			}
+			if seq > result.seqHi {
+				result.seqHi = seq
+			}
+		}
+	}
+	if result.records == 0 {
+		result.seqLo = 0
+	}
+	return result, nil
+}
+
+// rangeDeletionsMeta converts the add result to the persisted summary.
+func (r rangeAddResult) meta() sstRangeDeletionsMeta {
+	if r.records == 0 {
+		return sstRangeDeletionsMeta{}
+	}
+	return sstRangeDeletionsMeta{
+		Count:  r.records,
+		MinKey: append([]byte(nil), r.minKey...),
+		MaxKey: append([]byte(nil), r.maxKey...),
+	}
+}
+
 type writeSSTResult struct {
 	Meta    sstMetadata
 	SSTData []byte
@@ -38,10 +95,17 @@ func writeSST(
 	it sstIterator,
 	opts sstWriterOptions,
 	epoch uint64,
+	tombstones ...[]internal.RangeTombstone,
 ) (result writeSSTResult, err error) {
 	defer func() {
 		err = errors.Join(err, it.Close())
 	}()
+
+	var rangeTombstones []internal.RangeTombstone
+	if len(tombstones) > 0 {
+		rangeTombstones = tombstones[0]
+	}
+	fragments := fragmentRangeTombstones(rangeTombstones)
 
 	sstBuf := new(bytes.Buffer)
 	writable := newHashingWritable(sstBuf)
@@ -91,7 +155,14 @@ func writeSST(
 	if err := it.Err(); err != nil {
 		return abort(err)
 	}
-	if !state.found {
+
+	// Tombstones are independent of point ordering; add them after the point
+	// run but before Close so they land in the range-deletion block.
+	rangeResult, err := addRangeFragments(sst, fragments)
+	if err != nil {
+		return abort(err)
+	}
+	if !state.found && rangeResult.records == 0 {
 		return abort(errEmptyIterator)
 	}
 	if err := sst.Close(); err != nil {
@@ -113,20 +184,57 @@ func writeSST(
 
 	result.SSTData = sstBuf.Bytes()
 
+	seqLo, seqHi := unionSeqBounds(state, rangeResult)
 	result.Meta = sstMetadata{
-		ID:         buildSSTID(epoch, state.seqLo, state.seqHi, hashStr),
-		Epoch:      epoch,
-		SeqLo:      state.seqLo,
-		SeqHi:      state.seqHi,
-		MinKey:     state.minKey,
-		MaxKey:     state.maxKey,
-		Size:       sstSize,
-		Checksum:   "sha256:" + hashStr,
-		Bloom:      bloom,
-		CreatedAt:  time.Now().UTC(),
-		MetaOffset: metaOffset,
+		ID:              buildSSTID(epoch, seqLo, seqHi, hashStr),
+		Epoch:           epoch,
+		SeqLo:           seqLo,
+		SeqHi:           seqHi,
+		MinKey:          minBytesOr(state.minKey, rangeResult.minKey),
+		MaxKey:          maxBytesOr(state.maxKey, rangeResult.maxKey),
+		Size:            sstSize,
+		Checksum:        "sha256:" + hashStr,
+		Bloom:           bloom,
+		CreatedAt:       time.Now().UTC(),
+		MetaOffset:      metaOffset,
+		RangeDeletions:  rangeResult.meta(),
 	}
 	return result, nil
+}
+
+// unionSeqBounds merges the point build state with the range-tombstone add
+// result. An absent point run contributes nothing.
+func unionSeqBounds(state *sstBuildState, ranges rangeAddResult) (uint64, uint64) {
+	seqLo, seqHi := ranges.seqLo, ranges.seqHi
+	if state.found {
+		if state.seqLo < seqLo {
+			seqLo = state.seqLo
+		}
+		if state.seqHi > seqHi {
+			seqHi = state.seqHi
+		}
+	}
+	return seqLo, seqHi
+}
+
+func minBytesOr(a, b []byte) []byte {
+	if len(a) == 0 {
+		return b
+	}
+	if len(b) == 0 || bytes.Compare(a, b) <= 0 {
+		return a
+	}
+	return b
+}
+
+func maxBytesOr(a, b []byte) []byte {
+	if len(a) == 0 {
+		return b
+	}
+	if len(b) == 0 || bytes.Compare(a, b) >= 0 {
+		return a
+	}
+	return b
 }
 
 // pebbleWriterOptions builds the Pebble options shared by every SST writer.

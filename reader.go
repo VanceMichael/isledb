@@ -44,10 +44,11 @@ type Reader struct {
 	ownsBlockCache bool
 	cacheDir       string
 
-	lifecycleMu            sync.RWMutex
-	iteratorsMu            sync.Mutex
-	iterators              map[*Iterator]struct{}
-	mu                     sync.RWMutex
+	lifecycleMu         sync.RWMutex
+	iteratorsMu         sync.Mutex
+	iterators           map[*Iterator]struct{}
+	rangeTombstoneCache *sstRangeTombstoneCache
+	mu                  sync.RWMutex
 	manifest               *manifestState
 	version                Version
 	changeFeed             bool
@@ -123,6 +124,7 @@ func newReader(ctx context.Context, store *blobstore.Store, opts readerOptions) 
 		fileCache:                fileCache,
 		blockCache:               blockCache,
 		bloomCache:               newBloomFilterCache(opts.BloomCacheSize),
+		rangeTombstoneCache:      newRangeTombstoneCache(),
 		verifySST:                opts.ValidateSSTChecksum,
 		allowUnverifiedRangeRead: opts.AllowUnverifiedRangeRead,
 		rangeReadMinSSTSize:      opts.RangeReadMinSSTSize,
@@ -232,7 +234,8 @@ func (r *Reader) publishManifestView(
 
 	// Manifest states and SST IDs are immutable after publication. Swap the view
 	// and its metadata under one short critical section. Artifact and decoded
-	// Bloom caches remain byte-bounded and age retired entries through their LRUs.
+	// Bloom caches remain byte-bounded and age retired entries through their LRU.
+	r.rangeTombstoneCache.clear()
 	r.mu.Lock()
 	r.manifest = m
 	r.version = versionFromCurrent(current)
@@ -501,37 +504,59 @@ func (r *Reader) getWithManifest(ctx context.Context, m *manifestState, key []by
 		return nil, false, errors.New("manifest not loaded")
 	}
 
+	// SSTs are visited newest-first within L0 and then by increasing level.
+	// maxCover is the largest tombstone sequence seen so far that covers key.
+	var maxCover uint64
+
+	visit := func(sst sstMetadata) ([]byte, bool, bool, error) {
+		point, coverSeq, err := r.getFromSST(ctx, sst, key)
+		if coverSeq > maxCover {
+			maxCover = coverSeq
+		}
+		if err != nil || !point.found {
+			return nil, false, false, err
+		}
+		// A point hidden by a newer-or-equal covering tombstone resolves the
+		// lookup as absent; older SSTs cannot contain a newer value.
+		if point.deleted || point.seq <= maxCover {
+			return nil, false, true, nil
+		}
+		return point.value, true, false, nil
+	}
+
 	for _, sst := range m.L0SSTs {
 		if !keyInSSTRange(key, sst.MinKey, sst.MaxKey) {
 			continue
 		}
-		val, got, deleted, err := r.getFromSST(ctx, sst, key)
+		value, found, absent, err := visit(sst)
 		if err != nil {
 			return nil, false, err
 		}
-		if got {
-			if deleted {
-				return nil, false, nil
-			}
-			return val, true, nil
+		if found {
+			return value, true, nil
+		}
+		if absent {
+			return nil, false, nil
 		}
 	}
 
 	for i := range m.Levels {
+		// FindSST searches the SST's union bounds (points plus tombstone
+		// coverage), so it also locates tables whose only coverage for key is
+		// a range tombstone.
 		sst := m.Levels[i].FindSST(key)
 		if sst == nil {
 			continue
 		}
-
-		val, got, deleted, err := r.getFromSST(ctx, *sst, key)
+		value, found, absent, err := visit(*sst)
 		if err != nil {
 			return nil, false, err
 		}
-		if got {
-			if deleted {
-				return nil, false, nil
-			}
-			return val, true, nil
+		if found {
+			return value, true, nil
+		}
+		if absent {
+			return nil, false, nil
 		}
 	}
 
@@ -707,32 +732,55 @@ func keyInSSTRange(key, minKey, maxKey []byte) bool {
 	return true
 }
 
+// pointLookupResult is the point-key outcome of reading one SST.
+type pointLookupResult struct {
+	value   []byte
+	found   bool
+	deleted bool
+	seq     uint64
+}
+
 func (r *Reader) getFromSST(
 	ctx context.Context,
 	sstMeta sstMetadata,
 	key []byte,
-) (value []byte, found bool, tombstone bool, err error) {
+) (point pointLookupResult, coverSeq uint64, err error) {
+	// Range tombstones are checked independently of the point Bloom. A Bloom
+	// verdict that key is absent must never skip a possible covering
+	// tombstone, so load tombstones first.
+	if sstMeta.RangeDeletions.Count > 0 {
+		tombstones, tombstoneErr := r.loadRangeTombstones(ctx, sstMeta)
+		if tombstoneErr != nil {
+			return point, 0, tombstoneErr
+		}
+		for _, tombstone := range tombstones {
+			if tombstone.Contains(key) && tombstone.Seq > coverSeq {
+				coverSeq = tombstone.Seq
+			}
+		}
+	}
+
+	// Bloom only gates the point read.
 	if hasUsableBloom(sstMeta) {
 		if filter, ok := r.bloomCache.get(sstMeta.ID); ok {
 			if !filter.mayContain(bloomHashKey(key)) {
-				return nil, false, false, nil
+				return point, coverSeq, nil
 			}
 		} else if !r.sstResident(sstMeta) {
 			if !r.bloomMayContain(ctx, sstMeta, key) {
-				return nil, false, false, nil
+				return point, coverSeq, nil
 			}
 		}
 	}
 
 	_, iter, err := r.openSSTIterBounded(ctx, sstMeta, key, nil)
 	if err != nil {
-		return nil, false, false, err
+		return point, coverSeq, err
 	}
 	defer func() {
 		if closeErr := iter.Close(); closeErr != nil {
-			value = nil
-			found = false
-			tombstone = false
+			point = pointLookupResult{}
+			coverSeq = 0
 			err = errors.Join(err, closeErr)
 		}
 	}()
@@ -740,34 +788,41 @@ func (r *Reader) getFromSST(
 	kv := iter.First()
 	if kv == nil {
 		if err := iter.Error(); err != nil {
-			return nil, false, false, err
+			return point, coverSeq, err
 		}
-		return nil, false, false, nil
+		return point, coverSeq, nil
 	}
 
 	if !bytes.Equal(kv.K.UserKey, key) {
-		return nil, false, false, nil
+		return point, coverSeq, nil
 	}
 
 	raw, _, err := kv.V.Value(nil)
 	if err != nil {
-		return nil, false, false, err
+		return point, coverSeq, err
 	}
 	decoded, err := internal.DecodeKeyEntry(kv.K.UserKey, raw)
 	if err != nil {
-		return nil, false, false, err
+		return point, coverSeq, err
 	}
 
 	nowMs := time.Now().UnixMilli()
-	if decoded.IsExpired(nowMs) {
-
-		return nil, true, true, nil
+	if decoded.IsExpired(nowMs) || decoded.Kind == internal.OpDelete {
+		point.found = true
+		point.deleted = true
+		point.seq = sstPointSeq(kv.K)
+		return point, coverSeq, nil
 	}
+	point.found = true
+	point.value = append([]byte(nil), decoded.Value...)
+	point.seq = sstPointSeq(kv.K)
+	return point, coverSeq, nil
+}
 
-	if decoded.Kind == internal.OpDelete {
-		return nil, true, true, nil
-	}
-	return append([]byte(nil), decoded.Value...), true, false, nil
+// sstPointSeq extracts the sequence number from an SST internal key. The
+// caller's key already equals the user key.
+func sstPointSeq(key sstInternalKey) uint64 {
+	return uint64(key.SeqNum())
 }
 
 // bloomMayContain returns false only when a verified, decoded Bloom filter
